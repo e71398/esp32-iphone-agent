@@ -1,0 +1,162 @@
+name: P1-A unsigned iOS device IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: Bundle ID used for sideloading
+        required: true
+        default: com.onehumanbeing.esp32agent.sideload
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      BUNDLE_ID: ${{ inputs.bundle_id }}
+    steps:
+      - name: Checkout official v1.0.10 source
+        uses: actions/checkout@v4
+        with:
+          repository: onehumanbeing/esp32-iphone-agent
+          ref: v1.0.10
+          persist-credentials: false
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Validate bundle ID
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, re, sys
+          value = os.environ["BUNDLE_ID"]
+          if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?", value) or ".." in value:
+              print("invalid bundle id: " + value, file=sys.stderr)
+              sys.exit(1)
+          print("BUNDLE_ID=" + value)
+          PY
+
+      - name: Resolve Swift packages
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild -resolvePackageDependencies \
+            -project IPhoneAgent.xcodeproj \
+            -scheme IPhoneAgent \
+            -configuration Release \
+            -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/build/SourcePackages"
+
+      - name: Archive unsigned device build
+        working-directory: ios
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -project IPhoneAgent.xcodeproj \
+            -scheme IPhoneAgent \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$GITHUB_WORKSPACE/build/IPhoneAgent.xcarchive" \
+            -derivedDataPath "$GITHUB_WORKSPACE/build/DerivedData" \
+            -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/build/SourcePackages" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            ENTITLEMENTS_REQUIRED=NO \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            IA_ENTITLEMENTS= \
+            IA_WIDGET_ENTITLEMENTS= \
+            IA_BUNDLE_ID="$BUNDLE_ID" \
+            IPHONEOS_DEPLOYMENT_TARGET=16.4 \
+            ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES=YES \
+            archive
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$GITHUB_WORKSPACE/build/IPhoneAgent.xcarchive/Products/Applications/IPhoneAgent.app"
+          test -d "$APP"
+          test -d "$APP/PlugIns/AgentActivity.appex"
+          mkdir -p "$GITHUB_WORKSPACE/build/ipa/Payload"
+          rm -rf "$GITHUB_WORKSPACE/build/ipa/Payload/IPhoneAgent.app"
+          cp -R "$APP" "$GITHUB_WORKSPACE/build/ipa/Payload/"
+          rm -rf "$GITHUB_WORKSPACE/build/ipa/Payload/IPhoneAgent.app/_CodeSignature"
+          cd "$GITHUB_WORKSPACE/build/ipa"
+          zip -qry "$GITHUB_WORKSPACE/build/IPhoneAgent-unsigned.ipa" Payload
+          shasum -a 256 "$GITHUB_WORKSPACE/build/IPhoneAgent-unsigned.ipa" | tee "$GITHUB_WORKSPACE/build/IPhoneAgent-unsigned.ipa.sha256"
+
+      - name: Verify IPA
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, plistlib, subprocess, zipfile, pathlib
+          ipa = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "build" / "IPhoneAgent-unsigned.ipa"
+          bundle_id = os.environ["BUNDLE_ID"]
+          with zipfile.ZipFile(ipa) as z:
+              bad = z.testzip()
+              if bad:
+                  raise SystemExit("bad zip entry: " + bad)
+              names = set(z.namelist())
+              app_info_name = "Payload/IPhoneAgent.app/Info.plist"
+              ext_info_name = "Payload/IPhoneAgent.app/PlugIns/AgentActivity.appex/Info.plist"
+              if app_info_name not in names:
+                  raise SystemExit("missing app Info.plist")
+              if ext_info_name not in names:
+                  raise SystemExit("missing extension Info.plist")
+              info = plistlib.load(z.open(app_info_name))
+              ext = plistlib.load(z.open(ext_info_name))
+              exe = info.get("CFBundleExecutable")
+              ext_exe = ext.get("CFBundleExecutable")
+              exe_name = "Payload/IPhoneAgent.app/" + exe
+              ext_exe_name = "Payload/IPhoneAgent.app/PlugIns/AgentActivity.appex/" + ext_exe
+              if exe_name not in names or ext_exe_name not in names:
+                  raise SystemExit("missing executable in IPA")
+              local_app = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "build" / "ipa" / exe_name
+              local_ext = pathlib.Path(os.environ["GITHUB_WORKSPACE"]) / "build" / "ipa" / ext_exe_name
+              for label, path in [("app", local_app), ("extension", local_ext)]:
+                  out = subprocess.check_output(["lipo", "-info", str(path)], text=True).strip()
+                  print(label + ": " + out)
+                  if "arm64" not in out or "x86_64" in out:
+                      raise SystemExit(label + " is not device arm64")
+              checks = {
+                  "CFBundleIdentifier": info.get("CFBundleIdentifier"),
+                  "CFBundleShortVersionString": info.get("CFBundleShortVersionString"),
+                  "CFBundleVersion": info.get("CFBundleVersion"),
+                  "extension CFBundleIdentifier": ext.get("CFBundleIdentifier"),
+                  "BLE usage": info.get("NSBluetoothAlwaysUsageDescription"),
+                  "background modes": info.get("UIBackgroundModes"),
+              }
+              for key, value in checks.items():
+                  print(key + ": " + repr(value))
+              if checks["CFBundleIdentifier"] != bundle_id:
+                  raise SystemExit("app bundle id mismatch")
+              if checks["extension CFBundleIdentifier"] != bundle_id + ".activity":
+                  raise SystemExit("extension bundle id mismatch")
+              if checks["CFBundleShortVersionString"] != "1.0.10":
+                  raise SystemExit("version mismatch")
+              if not checks["BLE usage"]:
+                  raise SystemExit("missing BLE usage description")
+              if "bluetooth-central" not in (checks["background modes"] or []):
+                  raise SystemExit("missing bluetooth-central background mode")
+          print("IPA_VERIFY=PASS")
+          PY
+
+      - name: IPA summary
+        run: |
+          set -euo pipefail
+          echo "## P1-A IPA" >> "$GITHUB_STEP_SUMMARY"
+          echo "- source: official v1.0.10" >> "$GITHUB_STEP_SUMMARY"
+          echo "- bundle_id: $BUNDLE_ID" >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_WORKSPACE/build/IPhoneAgent-unsigned.ipa.sha256" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPhoneAgent-1.0.10-unsigned-device-arm64
+          path: |
+            build/IPhoneAgent-unsigned.ipa
+            build/IPhoneAgent-unsigned.ipa.sha256
+          if-no-files-found: error
