@@ -1,0 +1,29 @@
+# Host unit tests for the firmware's pure-C parts. Usage: make -C hardware/tests
+SRC = ../hid_bridge/src
+CFLAGS = -std=c11 -Wall -Wextra -g -fsanitize=address,undefined
+
+# mbedtls 3.x (4.x dropped the ECP API): Homebrew's mbedtls@3, an older Homebrew mbedtls, or the system one (apt libmbedtls-dev)
+BREW := $(shell brew --prefix 2>/dev/null)
+MBEDTLS := $(firstword $(wildcard $(BREW)/opt/mbedtls@3 $(BREW)/opt/mbedtls) /usr)
+
+test: test_main.c $(SRC)/bplist/bplist.c $(SRC)/video/gop.c $(SRC)/airplay/keystream.c $(SRC)/cli/cli_proto.c $(SRC)/hid/arbiter.c $(SRC)/hid/pace.c $(SRC)/log/logring.c $(SRC)/airplay/mdns.c $(SRC)/airplay/audio.c $(SRC)/heard/heard.c $(SRC)/net/lan_lock.c $(SRC)/ui/sw_model.c $(SRC)/ui/sw_face.c $(SRC)/ui/sw_text.c $(SRC)/ui/ima_adpcm.c $(SRC)/ui/sw_power.c $(SRC)/ui/sw_warn.c
+	$(CC) $(CFLAGS) -Istubs -I$(MBEDTLS)/include -o $@ $^ -L$(MBEDTLS)/lib -lmbedcrypto -lm
+	./test
+
+clean:
+	rm -f test
+
+.PHONY: clean
+
+.PHONY: check-hid
+check-hid:
+	mkdir -p ../build/tests
+	$(CXX) -std=c++11 -Wall -Wextra -g -fsanitize=address,undefined -o ../build/tests/test_hid test_hid_keys.cpp
+	../build/tests/test_hid
+	python3 test_build_targets.py
+	$(CXX) -std=c++11 -Wall -Wextra -g -fsanitize=address,undefined -o ../build/tests/test_board_usb test_board_support.cpp ../hid_bridge/board_support.cpp
+	../build/tests/test_board_usb
+	$(CXX) -std=c++11 -Wall -Wextra -g -fsanitize=address,undefined -DHID_TRANSPORT_BLE=1 -o ../build/tests/test_board_ble test_board_support.cpp ../hid_bridge/board_support.cpp
+	../build/tests/test_board_ble
+	$(CXX) -std=c++11 -Wall -Wextra -g -fsanitize=address,undefined -DHID_TRANSPORT_BLE=1 -DM5_STOPWATCH=1 -o ../build/tests/test_board_stopwatch test_board_support.cpp ../hid_bridge/board_support.cpp
+	../build/tests/test_board_stopwatch

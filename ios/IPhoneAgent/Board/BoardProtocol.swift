@@ -1,0 +1,126 @@
+import CoreBluetooth
+import Foundation
+
+/// GATT layout and message formats from docs/ble-protocol.md.
+enum BoardUUID {
+    static func make(_ suffix: String) -> CBUUID { CBUUID(string: "6e400001-a9e8-4b1b-9c39-6d6f8a3c" + suffix) }
+    static let service = make("0000")
+    static let cmd = make("0001")
+    static let reply = make("0002")
+    static let status = make("0003")
+    static let video = make("0004")
+    static let net = make("0005")
+    static let all = [cmd, reply, status, video, net]
+}
+
+/// The 1 s JSON heartbeat on `status`.
+struct BoardStatus: Codable, Equatable {
+    struct BLE: Codable, Equatable {
+        var mtu: Int?, phy: Int?, kbps: Double?, drop: Int?
+    }
+    /// The Wi-Fi video session (VideoSocket): n = 1 while the board sends video over UDP.
+    struct UDP: Codable, Equatable {
+        var n: Int?, kbps: Double?, nack: Int?, drop: Int?
+    }
+    var fw: FirmwareVersion?  // firmware version (hardware/hid_bridge/version.h); boards before OTA don't send it
+    var tchunk: Int?   // 1: `type` can stop early and reply "err typed N of M: budget|asleep" (firmware 0.2.6)
+    var up: Int?
+    var rst: String?
+    var heap: Int?
+    var psram: Int?
+    var abs: Int?      // 1: an absolute mouse (flash.sh --abs); in every status, so missing means a relative one
+    var usb: String?   // ok | asleep | off
+    var board: String? // Board model; absent on stock USB firmware.
+    var hid: String?   // BLE HID on this connection: ok once paired and subscribed.
+    var hidm: String?  // usb | ble: the input this --dual-hid board uses now, switched with `hidmode`; nil: fixed
+    var net: String?   // ap | sta | none
+    var ip: String?
+    var sta: Int?
+    var ap: String?    // idle | connected | streaming; "other" here when another device mirrors (seen(by:))
+    var src: String?   // the mirroring sender's hardware model ("iPad15,3"), "" when none; nil: older firmware
+    var w: Int?, h: Int?
+    var kbps: Double?, fps: Double?, idr: Int?, gop: Int?
+    var vage: Int?     // ms since the board's last frame from AirPlay (firmware 0.2.1+)
+    var ovf: Int?      // times the board's GOP buffer filled up (0.2.2+)
+    var fz: Int?       // 1: GOP full, no new frame until mirroring sends a keyframe (0.2.2+; nil = 0)
+    var ble: BLE?
+    var udp: UDP?
+    var own: Int?      // LAN lock (LanAuth): 1 = on a home network with an owner, only it may mirror; nil = no lock
+    var ui: Int?       // 1: the board has a screen that shows the run (`ui` lines, StopWatchUI); nil: no screen
+    var ota: Int?      // 1: a StopWatch that takes its own release channel (the listener starts on `ota on`)
+
+    var isWirelessHID: Bool { hid != nil }
+    /// Mouse and keyboard go over Bluetooth now: a Bluetooth board, or a --dual-hid one switched to it.
+    var bleInput: Bool { hidm.map { $0 == "ble" } ?? isWirelessHID }
+    /// The link the mouse and keyboard go over now: "usb" or "ble".
+    var hidTransport: String { hidm ?? (isWirelessHID ? "ble" : "usb") }
+    // A named board must report its input capability: its USB port may only supply power.
+    var inputState: String? { hid ?? (board == nil ? usb : nil) }
+    var inputReady: Bool { inputState == "ok" }
+    var needsWirelessPointer: Bool { isWirelessHID && !inputReady }
+    var needsUSBHost: Bool { !isWirelessHID && inputState == "off" }
+    // The signed feed ships only standard USB images; wait for positive identification. A --dual-hid board in USB
+    // mode (hidm) runs no OTA server: offering it the USB release would ask on every connection and always fail.
+    var acceptsUSBRelease: Bool { board == nil && hid == nil && hidm == nil && usb != nil }
+    /// The release channel this board takes (Firmware.usbTarget or its own, as its image's marker); nil: none.
+    var releaseTarget: String? {
+        if acceptsUSBRelease { return Firmware.usbTarget }
+        return board == "stopwatch" && ota == 1 ? "stopwatch" : nil
+    }
+
+    static func decode(_ data: Data) -> BoardStatus? { try? JSONDecoder().decode(BoardStatus.self, from: data) }
+
+    /// The status as this device sees it: another device's mirroring (an iPhone still mirroring while the iPad
+    /// connects, 2026-11-19) is not this one's screen, so it reads "other", never "streaming". An unknown sender
+    /// (older firmware, or before SETUP) counts as this device, as before.
+    func seen(by model: String) -> BoardStatus {
+        guard let src, !src.isEmpty, src != model, let ap, ap != "idle" else { return self }
+        var s = self
+        s.ap = "other"
+        return s
+    }
+
+    /// A small MTU makes the board notify a reduced object (up, usb, net, ap, ble.mtu); a `status` read returns
+    /// the full one. Newer fields win, missing ones keep their last value.
+    func merged(with n: BoardStatus) -> BoardStatus {
+        var m = n
+        m.board = n.board ?? board; m.hid = n.hid ?? hid; m.hidm = n.hidm ?? hidm
+        m.fw = n.fw ?? fw
+        m.tchunk = n.tchunk ?? tchunk
+        m.up = n.up ?? up; m.rst = n.rst ?? rst; m.heap = n.heap ?? heap; m.psram = n.psram ?? psram
+        // abs is not carried over (m.abs stays n.abs): a board flashed back to the relative mouse must not keep it
+        m.usb = n.usb ?? usb; m.net = n.net ?? net; m.ip = n.ip ?? ip; m.sta = n.sta ?? sta; m.ap = n.ap ?? ap
+        m.src = n.src ?? src
+        m.ui = n.ui ?? ui
+        m.w = n.w ?? w; m.h = n.h ?? h; m.kbps = n.kbps ?? kbps; m.fps = n.fps ?? fps; m.idr = n.idr ?? idr
+        m.gop = n.gop ?? gop; m.vage = n.vage ?? vage; m.ovf = n.ovf ?? ovf; m.fz = n.fz ?? fz
+        let a = ble ?? BLE(), b = n.ble ?? BLE()
+        m.ble = BLE(mtu: b.mtu ?? a.mtu, phy: b.phy ?? a.phy, kbps: b.kbps ?? a.kbps, drop: b.drop ?? a.drop)
+        m.udp = n.udp ?? udp
+        // own is not carried over either (in every status): a board flashed back to older firmware has no lock
+        return m
+    }
+}
+
+/// The `net` characteristic: SoftAP credentials (read) or Wi-Fi mode (write).
+struct NetConfig: Codable, Equatable {
+    var mode: String
+    var ssid: String?
+    var pass: String?
+    var ip: String?
+    var vtok: String?  // per-boot token for the Wi-Fi video channel (VideoSocket)
+}
+
+/// A `reply` notify: `<id> ok [extra]` or `<id> err <reason>`.
+struct BoardReply: Equatable {
+    let id: Int
+    let ok: Bool
+    let text: String  // extra after "ok", or the error reason
+
+    static func parse(_ line: String) -> BoardReply? {
+        let parts = line.trimmingCharacters(in: .whitespacesAndNewlines).split(separator: " ", maxSplits: 2)
+            .map(String.init)
+        guard parts.count >= 2, let id = Int(parts[0]), parts[1] == "ok" || parts[1] == "err" else { return nil }
+        return BoardReply(id: id, ok: parts[1] == "ok", text: parts.count > 2 ? parts[2] : "")
+    }
+}

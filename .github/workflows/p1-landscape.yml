@@ -1,0 +1,128 @@
+name: P1 Landscape Test and IPA
+
+on:
+  push:
+    branches:
+      - p1-landscape-fix
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Pick iPhone simulator
+        run: |
+          sdk=$(xcrun --sdk iphonesimulator --show-sdk-version)
+          udid=$(xcrun simctl list devices available -j | SDK="$sdk" python3 -c '
+          import json, os, sys
+          devs = json.load(sys.stdin)["devices"]
+          sdk = os.environ["SDK"].replace(".", "-")
+          rts = sorted((k for k in devs if ".iOS-" in k), key=lambda k: (not k.endswith("iOS-" + sdk), k))
+          for rt in rts:
+              phones = [d for d in devs[rt] if d["name"].startswith("iPhone ")]
+              phones.sort(key=lambda d: "Pro" not in d["name"])
+              if phones:
+                  print(phones[0]["udid"]); print(phones[0]["name"], rt, file=sys.stderr); break
+          ')
+          test -n "$udid"
+          echo "SIM_UDID=$udid" >> "$GITHUB_ENV"
+      - name: Build for testing (unsigned)
+        run: |
+          xcodebuild build-for-testing -scheme IPhoneAgent -destination "id=$SIM_UDID" \
+            -derivedDataPath build-p1 CODE_SIGNING_ALLOWED=NO
+      - name: Boot simulator
+        timeout-minutes: 10
+        run: xcrun simctl bootstatus "$SIM_UDID" -b
+      - name: Run unit and landscape XCTest
+        run: |
+          xcodebuild test-without-building -scheme IPhoneAgent -destination "id=$SIM_UDID" \
+            -only-testing:IPhoneAgentTests \
+            -derivedDataPath build-p1 -resultBundlePath build-p1/TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO -collect-test-diagnostics never
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: p1-xctest-results
+          path: ios/build-p1/TestResults.xcresult
+          if-no-files-found: warn
+
+  ipa:
+    needs: tests
+    runs-on: macos-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ios
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build unsigned arm64 archive
+        run: |
+          mkdir -p build-unsigned
+          xcodebuild -project IPhoneAgent.xcodeproj -scheme IPhoneAgent -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath "$GITHUB_WORKSPACE/ios/build-unsigned/IPhoneAgent.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            SKIP_INSTALL=NO archive
+      - name: Package unsigned IPA and verify bundle
+        run: |
+          set -euo pipefail
+          archive="$GITHUB_WORKSPACE/ios/build-unsigned/IPhoneAgent.xcarchive"
+          app="$archive/Products/Applications/IPhoneAgent.app"
+          staging="$GITHUB_WORKSPACE/ios/build-unsigned/staging"
+          ipa="$GITHUB_WORKSPACE/ios/build-unsigned/IPhoneAgent-p1-unsigned.ipa"
+          test -d "$app"
+          test -d "$app/PlugIns/AgentActivity.appex"
+          plutil -lint "$app/Info.plist"
+          plutil -lint "$app/PlugIns/AgentActivity.appex/Info.plist"
+          bundle_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Info.plist")
+          min_ios=$(/usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$app/Info.plist")
+          ext_id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/PlugIns/AgentActivity.appex/Info.plist")
+          test "$bundle_id" = "com.example.esp32agent"
+          test "$ext_id" = "com.example.esp32agent.activity"
+          test "$min_ios" = "16.4"
+          if find "$app" -name embedded.provisionprofile -print -quit | grep -q .; then
+            echo "unexpected embedded provisioning profile"
+            exit 1
+          fi
+          rm -rf "$staging"
+          mkdir -p "$staging/Payload"
+          cp -R "$app" "$staging/Payload/"
+          (cd "$staging" && zip -qry "$ipa" Payload)
+          size=$(stat -f%z "$ipa")
+          sha=$(shasum -a 256 "$ipa" | awk '{print $1}')
+          {
+            echo "file=IPhoneAgent-p1-unsigned.ipa"
+            echo "size=$size"
+            echo "sha256=$sha"
+            echo "bundle_id=$bundle_id"
+            echo "extension=$ext_id"
+            echo "minimum_ios=$min_ios"
+            echo "signature=unsigned"
+          } > "$GITHUB_WORKSPACE/ios/build-unsigned/IPA_INFO.txt"
+          cat "$GITHUB_WORKSPACE/ios/build-unsigned/IPA_INFO.txt"
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: p1-unsigned-arm64-ipa
+          path: |
+            ios/build-unsigned/IPhoneAgent-p1-unsigned.ipa
+            ios/build-unsigned/IPA_INFO.txt
+          if-no-files-found: error
